@@ -11,13 +11,7 @@ SCOPE-RL addresses entropy collapse in GRPO by adding a small auxiliary update f
 ## Method
 
 For a prompt $q$, response $o=(o_1,\ldots,o_{|o|})$, and logits $\ell$, temperature sampling uses
-
-$$
-\pi_\theta^T(o_t\mid q,o_{<t})
-=\frac{\exp(\ell(q,o_{<t},o_t)/T)}
-{\sum_v\exp(\ell(q,o_{<t},v)/T)}.
-$$
-
+$\pi_\theta^T(o_t\mid q,o_{<t})=\frac{\exp(\ell(q,o_{<t},o_t)/T)}{\sum_v\exp(\ell(q,o_{<t},v)/T)}.$
 The feedback signal is the mean token entropy over valid generated tokens:
 
 $$
@@ -33,7 +27,7 @@ $$
 Given the preceding update's entropy $H(\pi_{\theta_{\mathrm{old}}})$ and target $H_0$, the auxiliary sampling temperature is
 
 $$
-T=\operatorname{clip}\!\left(
+T=\rm{clip}\!\left(
 1+H_0-H(\pi_{\theta_{\mathrm{old}}}),\,0.8,\,1.2
 \right).
 $$
@@ -48,7 +42,7 @@ J_{\mathrm{GRPO}}(\theta)=
 \sum_{t=1}^{|o_i|}
 \min\!\left(
 r_{i,t}(\theta)\hat A_i,\,
-\operatorname{clip}(r_{i,t}(\theta),1-\epsilon_{\mathrm{low}},1+\epsilon_{\mathrm{high}})\hat A_i
+\rm{clip}(r_{i,t}(\theta),1-\epsilon_{\mathrm{low}},1+\epsilon_{\mathrm{high}})\hat A_i
 \right)
 \right],
 $$
@@ -61,8 +55,8 @@ r_{i,t}(\theta)=
 {\pi_{\theta_{\mathrm{old}}}(o_{i,t}\mid q,o_{i,<t})},
 \qquad
 \hat A_i=
-\frac{R(q,o_i)-\operatorname{mean}_{j=1}^{G}R(q,o_j)}
-{\operatorname{std}_{j=1}^{G}R(q,o_j)}.
+\frac{R(q,o_i)-\rm{mean}_{j=1}^{G}R(q,o_j)}
+{\rm{std}_{j=1}^{G}R(q,o_j)}.
 $$
 
 SCOPE-RL adds a positive-trajectory regularizer to GRPO:
@@ -77,10 +71,11 @@ J_{\mathrm{SCOPE}}(\theta)=J_{\mathrm{GRPO}}(\theta)+
 \sum_{t=1}^{|o'_i|}
 \min\!\left(
 r'_{i,t}(\theta),\,
-\operatorname{clip}(r'_{i,t}(\theta),1-\epsilon,1+\epsilon)
+\rm{clip}(r'_{i,t}(\theta),1-\epsilon,1+\epsilon)
 \right)
 \right],
-\qquad
+$$
+$$
 r'_{i,t}(\theta)=
 \frac{\pi_\theta(o'_{i,t}\mid q,o'_{i,<t})}
 {\pi_{\theta_{\mathrm{old}}}(o'_{i,t}\mid q,o'_{i,<t})}.
