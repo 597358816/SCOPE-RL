@@ -85,7 +85,7 @@ class TrainerConfig:
     temperature_high: float = 1.2
     temperature_low: float = 0.8
     entropy_base: float = 0.5
-    reinforce_sample_num: int = 60
+    positive_sample_num: int = 64
 
     def post_init(self):
         if self.save_checkpoint_path is None:

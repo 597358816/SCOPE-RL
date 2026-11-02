@@ -1,97 +1,121 @@
-# Arbitrary Entropy Policy Optimization (AEPO)
+# SCOPE-RL
 
-**Entropy Is Controllable in Reinforcement Finetuning**
+**Stable and Quantitative Control of Policy Entropy in RL Post-Training**
 
-[![Paper](https://img.shields.io/badge/Paper-PDF-blue)]([[2510.08141] Arbitrary Entropy Policy Optimization: Entropy Is Controllable in Reinforcement Fine-tuning](https://arxiv.org/abs/2510.08141))
-[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+[Paper (arXiv:2510.08141)](https://arxiv.org/abs/2510.08141) · [Repository](https://github.com/597358816/SCOPE-RL)
 
----
+SCOPE-RL addresses entropy collapse in GRPO by adding a small auxiliary update from **positive trajectories sampled at an adaptive temperature**. High-temperature positives raise exploration when entropy is low; low-temperature positives stabilize it when entropy is high. The paper reports gains in both Pass@1 and Pass@k and finds that reasoning performance is best at a moderate entropy level.
 
-## 🧠 Introduction
+![SCOPE-RL overview](SCOPERL-main.png)
 
-**Arbitrary Entropy Policy Optimization (AEPO)** is a novel reinforcement finetuning (RFT) framework designed to address *entropy collapse* — a critical issue in large language model (LLM) post-training where exploration vanishes as entropy monotonically decreases.
+## Method
 
-Unlike traditional entropy regularization methods that trade exploration for stability, **AEPO achieves controllable and stable entropy regulation** through three unified design principles:
+For a prompt $q$, response $o=(o_1,\ldots,o_{|o|})$, and logits $\ell$, temperature sampling uses
 
-1. **Policy Gradient as Regularization**
-   Replaces explicit entropy bonuses with a REINFORCE-style policy gradient term applied to temperature-adjusted samples.
-2. **Distribution as Regularization**
-   Controls entropy implicitly by sampling from *temperature-regulated* distributions (`T_high` and `T_low`) based on current entropy state.
-3. **REINFORCE as Regularization**
-   Uses verifiable rewards to form one-sided, unbiased gradients that guide policy toward higher-quality distributions.
+$$
+\pi_\theta^T(o_t\mid q,o_{<t})
+=\frac{\exp(\ell(q,o_{<t},o_t)/T)}
+{\sum_v\exp(\ell(q,o_{<t},v)/T)}.
+$$
 
----
+The feedback signal is the mean token entropy over valid generated tokens:
 
-## 🚀 Highlights
+$$
+H(\pi_\theta)=
+\mathbb{E}_{q,o\sim\pi_\theta}
+\left[
+-\frac{1}{|o|}\sum_{t=1}^{|o|}
+\sum_v \pi_\theta(v\mid q,o_{<t})
+\log\pi_\theta(v\mid q,o_{<t})
+\right].
+$$
 
-- **Controllable Entropy:**
-  Precisely maintains entropy at any arbitrary target level `H`, completely eliminating entropy collapse.
-- **Entropy–Exploration–Performance Relation:**
-  Demonstrates a *non-monotonic* relationship — performance improves with moderate entropy but declines when entropy becomes excessive.
-- **Generalizable Framework:**
-  Beyond entropy control, AEPO provides a paradigm for learning under target distributions, generalizing to multimodal alignment and reasoning tasks.
+Given the preceding update's entropy $H(\pi_{\theta_{\mathrm{old}}})$ and target $H_0$, the auxiliary sampling temperature is
 
----
+$$
+T=\operatorname{clip}\!\left(
+1+H_0-H(\pi_{\theta_{\mathrm{old}}}),\,0.8,\,1.2
+\right).
+$$
 
-## 📊 Experimental Results
+The base GRPO objective is
 
-Experiments were conducted on **Qwen2.5-Math-7B** using the **EasyR1** and **VeRL** frameworks, across seven reasoning benchmarks:
-`AIME24`, `AMC`, `College Math`, `GSM8K`, `MATH`, `Minerva`, `Olympiad`.
+$$
+J_{\mathrm{GRPO}}(\theta)=
+\mathbb{E}_{q,\{o_i\}_{i=1}^{G}\sim\pi_{\theta_{\mathrm{old}}}}
+\left[
+\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}
+\sum_{t=1}^{|o_i|}
+\min\!\left(
+r_{i,t}(\theta)\hat A_i,\,
+\operatorname{clip}(r_{i,t}(\theta),1-\epsilon_{\mathrm{low}},1+\epsilon_{\mathrm{high}})\hat A_i
+\right)
+\right],
+$$
 
+where
 
-| Model             | Avg. Score | Entropy Stability |
-| :---------------- | :--------: | :---------------: |
-| Qwen2.5-Math-7B   |   37.66   |        —        |
-| GRPO              |   57.96   |    ❌ Collapse    |
-| Entropy-Reg       |   57.39   |   ⚠️ Unstable   |
-| Entropy-Adv       |   58.18   |    ❌ Collapse    |
-| **AEPO (H=0.75)** | **61.36** |     ✅ Stable     |
+$$
+r_{i,t}(\theta)=
+\frac{\pi_\theta(o_{i,t}\mid q,o_{i,<t})}
+{\pi_{\theta_{\mathrm{old}}}(o_{i,t}\mid q,o_{i,<t})},
+\qquad
+\hat A_i=
+\frac{R(q,o_i)-\operatorname{mean}_{j=1}^{G}R(q,o_j)}
+{\operatorname{std}_{j=1}^{G}R(q,o_j)}.
+$$
 
-> 📈 AEPO outperforms all entropy-based baselines and achieves stable exploration at arbitrary entropy targets.
+SCOPE-RL adds a positive-trajectory regularizer to GRPO:
 
----
+$$
+J_{\mathrm{SCOPE}}(\theta)=J_{\mathrm{GRPO}}(\theta)+
+\alpha\,
+\mathbb{E}_{q,\{o'_i\}_{i=1}^{G'}\sim\pi_{\theta_{\mathrm{old}}}^{T}}
+\left[
+\frac{1}{G'}\sum_{i=1}^{G'}
+\mathbf{1}[R(q,o'_i)=1]\frac{1}{|o'_i|}
+\sum_{t=1}^{|o'_i|}
+\min\!\left(
+r'_{i,t}(\theta),\,
+\operatorname{clip}(r'_{i,t}(\theta),1-\epsilon,1+\epsilon)
+\right)
+\right],
+\qquad
+r'_{i,t}(\theta)=
+\frac{\pi_\theta(o'_{i,t}\mid q,o'_{i,<t})}
+{\pi_{\theta_{\mathrm{old}}}(o'_{i,t}\mid q,o'_{i,<t})}.
+$$
 
-## 🧩 Method Overview
+The auxiliary trajectories are sampled with $\pi_{\theta_{\mathrm{old}}}^{T}$; the ratio in the regularizer uses the unscaled policy. In the paper's main setting, $H_0=0.5$, $\epsilon_{\mathrm{low}}=\epsilon_{\mathrm{high}}=\epsilon=0.2$, and the nominal auxiliary fraction is $\alpha=64/(512\times8)=1/64$.
 
-AEPO integrates into standard GRPO-style RFT pipelines as follows:
+## Results
 
-```math
-\nabla_\theta J_{AEPO} =
-\nabla_\theta J_{GRPO} +
-\alpha \cdot \mathbb{E}_{q,o \sim \pi_\theta^T}
-\left[\nabla_\theta \log \pi_\theta(o|q) \cdot R(q,o)\right],
-```
+**Average Pass@1 across seven math benchmarks** (paper [Table 1](https://arxiv.org/pdf/2510.08141#page=6); percentage points):
 
-where the temperature `T` switches adaptively according to the current entropy state of the policy:
+| Base model | Base | GRPO | SCOPE-RL | Gain vs. GRPO |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen2.5-Math-7B | 32.56 | 51.60 | **54.84** | +3.23 |
+| Qwen2.5-7B | 36.23 | 47.71 | **49.81** | +2.10 |
+| Qwen3-4B | 57.03 | 67.77 | **69.73** | +1.96 |
 
-```math
-T =
-\begin{cases}
-T_{high}, & \text{if } H(\pi_{\theta_{old}}) < H_{target} \\
-T_{low}, & \text{otherwise}
-\end{cases}
-```
+**Qwen2.5-7B Pass@1024 on AIME** (paper [Table 3](https://arxiv.org/pdf/2510.08141#page=7); %):
 
-## Requirements
+| Method | AIME24 | AIME25 |
+| --- | ---: | ---: |
+| Base | 80.0 | 73.3 |
+| GRPO | 73.3 | 63.3 |
+| SCOPE-RL | **86.7** | **76.7** |
 
-### Software
-
-Install via pip:
+## Quick start
 
 ```bash
-conda create -n AEPO python=3.11
-conda activate AEPO
-git clone https://github.com/597358816/AEPO.git
-cd AEPO
-pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 vllm==0.8.3 transformers==4.51.2 
+conda create -n scope-rl python=3.11
+conda activate scope-rl
+pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 vllm==0.8.3 transformers==4.51.2
 pip install ray==2.48.0 tensordict==0.9.1 pydantic==2.11.7
-pip install flash-attn
 pip install -e .
-pip install tensorboard
-cd example
-bash qwen-math-7b-AEPO.sh
+cd examples
+bash qwen-math-7b-SCOPE.sh
 ```
 
-### Evaluation
-
-The eval code is in：[https://github.com/QwenLM/Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math).
+Examples for Qwen2.5-Math-7B, Qwen2.5-7B, Qwen3-4B, and Llama-3.1-8B-Instruct are in [`examples/`](examples/), with matching GRPO baselines. Set model and data paths in each script before running. Evaluation follows [Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math).

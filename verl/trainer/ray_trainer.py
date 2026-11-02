@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import math
 import uuid
 from collections import defaultdict, Counter
 from contextlib import contextmanager
@@ -727,8 +728,9 @@ class RayPPOTrainer:
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
-        entropy = 0
-        entropy_base = self.config.trainer.entropy_base
+        # Feedback from the preceding standard rollout (the first step uses neutral defaults).
+        previous_entropy = self.config.trainer.entropy_base
+        previous_accuracy = 0.3
         val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
@@ -781,68 +783,75 @@ class RayPPOTrainer:
                     self._compute_adv(batch, timing_raw)
 
                     alg = self.config.trainer.algorithm           
-                    if alg=="AEPO":
-                        temperature = 1
-                        entropy_base = self.config.trainer.entropy_base
-                        if entropy <= entropy_base:
-                            temperature = self.config.trainer.temperature_high
-                        elif entropy > entropy_base:  
-                            temperature = self.config.trainer.temperature_low 
-                        gen_batch_bak = gen_batch_bak[:len(gen_batch_bak) // 4]
+                    if alg=="SCOPE":
+                        temperature = max(
+                            self.config.trainer.temperature_low,
+                            min(self.config.trainer.temperature_high,
+                                1.0 + self.config.trainer.entropy_base - previous_entropy),
+                        )
+                        rollout_n = self.config.worker.rollout.n
+                        target_positives = self.config.trainer.positive_sample_num
+                        # Estimate candidates from the previous step's pass rate. A hot
+                        # auxiliary rollout needs additional prompts to find positives.
+                        prompt_count = math.ceil(target_positives / (max(previous_accuracy, 1e-6) * rollout_n))
+                        if temperature > 1.0:
+                            prompt_count = math.ceil(prompt_count * temperature)
+                        prompt_count = 16 * math.ceil(prompt_count / 16)
+                        available_prompts = len(gen_batch_bak) // 16 * 16
+                        if available_prompts == 0:
+                            raise ValueError("SCOPE needs at least 16 prompts per training step")
+                        prompt_count = min(prompt_count, available_prompts)
+                        gen_batch_bak = gen_batch_bak[:prompt_count]
                         gen_batch_bak.meta_info["temperature"] = temperature
-                        gen_batch_bak.meta_info["n"] = self.config.worker.rollout.n   
-                        
+                        gen_batch_bak.meta_info["n"] = rollout_n
                         with _timer("gen", timing_raw):  
                             gen_batch_output_bak = self.actor_rollout_wg.generate_sequences(gen_batch_bak)
-                        batch_bak = batch_bak[:len(batch_bak) // 4].union(gen_batch_output_bak) 
+                        batch_bak = batch_bak[:prompt_count * rollout_n].union(gen_batch_output_bak)
                         self._compute_reward(batch_bak, timing_raw, metrics)
                         batch_bak.meta_info["global_token_num"] = torch.sum(batch_bak.batch["attention_mask"], dim=-1).tolist()
                         self._compute_values(batch_bak, timing_raw)
                         self._compute_adv(batch_bak, timing_raw)
-                        entropy_controller = _select_by_advantage(batch_bak, threshold = 0.05, absolute=False)
-                        entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
-                        if entropy <= entropy_base:
-                            sample_num = min(self.config.trainer.reinforce_sample_num, len(entropy_controller))
-                        elif entropy > entropy_base:  
-                            sample_num = min(self.config.trainer.reinforce_sample_num, len(entropy_controller)) // 2 
-                        entropy_batch = DataProto.concat([entropy_controller[:sample_num], batch[sample_num:]])
+                        # The auxiliary objective uses binary positive rewards, including
+                        # positives from groups whose GRPO advantage is zero or negative.
+                        positive_indices = (batch_bak.batch["token_level_scores"].sum(-1) > 0.5).nonzero(as_tuple=False).flatten()
+                        sample_num = min(target_positives, len(positive_indices))
+                        if sample_num:
+                            entropy_controller = batch_bak.select_by_index(positive_indices[:sample_num].tolist())
+                            entropy_controller.batch["advantages"] = torch.ones_like(entropy_controller.batch["advantages"])
+                            entropy_batch = DataProto.concat([entropy_controller, batch[sample_num:]])
+                        else:
+                            entropy_batch = batch
+                        entropy_batch.meta_info["global_token_num"] = torch.sum(
+                            entropy_batch.batch["attention_mask"], dim=-1
+                        ).tolist()
                         self._compute_old_log_probs(entropy_batch, timing_raw)
                         self._compute_ref_log_probs(entropy_batch, timing_raw)
                         self._update_critic(entropy_batch, timing_raw, metrics)
-                        self._update_actor(entropy_batch, timing_raw, metrics) 
-                    elif alg=="DCPO":  
-                        temperature = 1          
-                        if entropy <= entropy_base:
-                            temperature = 1.2
-                        elif entropy > entropy_base:     
-                            temperature = 0.8   
-                        entropy_delta = entropy_base-entropy
-                        _compute_bool_reward_by_score(batch, threshold = 0.05, absolute=False)
-                        self._compute_old_log_probs(batch, timing_raw)
-                        self._compute_old_log_probs(batch, timing_raw, temperature = temperature)
-                        old_log_probs = batch.batch['old_log_probs']
-                        old_log_probs_t = batch.batch['old_log_probs_t']
-                        entropy_factor = torch.exp(old_log_probs_t - old_log_probs)
-                        true_ratio = (batch.batch["bool_reward"]==1).sum() / len(batch)
-                        print("batch.batch['bool_reward'].shape:", batch.batch['bool_reward'].shape)
-                        alpha = entropy_delta 
-                        alpha = abs(alpha)
-                        alpha = min(alpha, 0.1)
-                        alpha = alpha / true_ratio
-                        alpha = alpha / (alpha + 1)
-                        batch.batch["advantages"] = (1-alpha) * batch.batch["advantages"] + alpha * batch.batch["bool_reward"].to(batch.batch["advantages"].dtype).unsqueeze(1) * entropy_factor
-                        self._compute_ref_log_probs(batch, timing_raw)
-                        self._update_critic(batch, timing_raw, metrics)
-                        self._update_actor(batch, timing_raw, metrics)
+                        # Entropy is measured on the standard rollout at the current
+                        # policy, using valid generated tokens only. Feed it to the
+                        # next update's temperature controller.
+                        with _timer("entropy", timing_raw):
+                            token_entropy = self.actor_rollout_wg.compute_entropy(batch).batch["entropy"]
+                        response_mask = batch.batch["response_mask"]
+                        current_entropy = VF.masked_mean(token_entropy, response_mask).item()
+                        current_accuracy = (batch.batch["token_level_scores"].sum(-1) > 0.5).float().mean().item()
+                        self._update_actor(entropy_batch, timing_raw, metrics)
+                        metrics.update({
+                            "scope/temperature": temperature,
+                            "scope/prompt_count": prompt_count,
+                            "scope/positive_count": sample_num,
+                            "scope/accuracy": current_accuracy,
+                            "scope/entropy": current_entropy,
+                        })
+                        previous_accuracy = current_accuracy
+                        previous_entropy = current_entropy
+
                     elif alg=="GRPO":                   
                         self._compute_old_log_probs(batch, timing_raw)
                         self._compute_ref_log_probs(batch, timing_raw)
                         self._update_critic(batch, timing_raw, metrics)
                         self._update_actor(batch, timing_raw, metrics)
 
-
-                    if "actor/entropy_loss" in metrics:
-                        entropy = metrics["actor/entropy_loss"]    
 
                     # validate
                     if (
